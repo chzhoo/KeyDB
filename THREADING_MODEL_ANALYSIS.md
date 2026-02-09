@@ -450,82 +450,722 @@ int chooseBestThreadForAccept() {
 }
 ```
 
-## 6. 命令执行流水线
+## 6. 命令执行流水线（详细）
 
-### 6.1 读取 → 解析 → 执行的完整流程
+命令的完整生命周期从网络数据到达开始，经历**读取 → 解析 → 路由 → 执行 → 写回复**五个阶段。在多线程环境下，每个阶段对锁的要求截然不同，这正是 KeyDB 实现高吞吐量的关键。
+
+### 6.1 总体流水线视图
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  readQueryFromClient() [无全局锁，持有客户端锁]                    │
-│  ├── connRead() 读取数据                                          │
-│  ├── parseClientCommandBuffer() 解析命令                          │
-│  │                                                                │
-│  ├── [尝试异步执行只读命令（无全局锁）]                            │
-│  │   processInputBuffer(c, false, CMD_CALL_ASYNC)                │
-│  │   └── processCommandAndResetClient(c, CMD_CALL_ASYNC)         │
-│  │       └── processCommand(c, CMD_CALL_ASYNC)                   │
-│  │           └── call(c, CMD_CALL_ASYNC)                         │
-│  │               └── 使用 MVCC 快照读取数据                       │
-│  │                                                                │
-│  ├── [无法异步执行的命令加入 vecclientsProcess 队列]               │
-│  │                                                                │
-│  └── [单线程模式下直接执行]                                       │
-│      AeLocker.arm(c) → 获取全局锁                                │
-│      processInputBuffer(c, true, CMD_CALL_FULL)                  │
-└──────────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  beforeSleep() [持有全局锁]                                       │
-│  ├── 结束过期的 MVCC 快照                                         │
-│  ├── runAndPropogateToReplicas(processClients)                   │
-│  │   └── 处理 vecclientsProcess 中的客户端                       │
-│  │       └── processInputBuffer(c, false, CMD_CALL_FULL)         │
-│  ├── handleClientsWithPendingWrites()                            │
-│  ├── freeClientsInAsyncFreeQueue()                               │
-│  ├── activeExpireCycle()                                         │
-│  └── AOF/RDB 相关处理                                            │
-└──────────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  afterSleep() [刚从 epoll_wait 返回]                              │
-│  ├── moduleAcquireGIL()                                          │
-│  ├── aeThreadOnline() → 获取 fork 读锁                           │
-│  ├── wakeTimeThread() → 唤醒时间线程                              │
-│  ├── 启动 GC epoch                                               │
-│  ├── aeAcquireLock() → 获取全局锁                                │
-│  │   trackChanges() → 开始追踪数据库变更                          │
-│  ├── aeReleaseLock()                                              │
-│  └── 重置 disable_async_commands                                  │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         一次完整的命令生命周期                            │
+│                                                                          │
+│  ┌─ 阶段1: 网络读取 ──────────────────────────────────────────────┐      │
+│  │  readQueryFromClient()                                          │      │
+│  │  锁: 仅客户端锁(c->lock), 无全局锁                              │      │
+│  │  工作: connRead() → 将数据追加到 c->querybuf                    │      │
+│  └────────────────────────────┬─────────────────────────────────────┘      │
+│                               ▼                                          │
+│  ┌─ 阶段2: 协议解析 ──────────────────────────────────────────────┐      │
+│  │  parseClientCommandBuffer()                                     │      │
+│  │  锁: 仅客户端锁, 无全局锁                                       │      │
+│  │  工作: RESP/Inline 协议解析 → 命令入队 c->vecqueuedcmd          │      │
+│  │  附加: prefetchKeysAsync() 预取键值（无锁优化）                  │      │
+│  └────────────────────────────┬─────────────────────────────────────┘      │
+│                               ▼                                          │
+│  ┌─ 阶段3: 命令路由（三条路径选择）─────────────────────────────────┐     │
+│  │                                                                   │     │
+│  │  路径A: 异步快速路径 (ASYNC)           ← 只读命令, 无全局锁       │     │
+│  │  路径B: 延迟批量路径 (DEFERRED)        ← 写命令, 等待 beforeSleep │     │
+│  │  路径C: 同步直通路径 (SYNC)            ← 单线程模式直接执行       │     │
+│  │                                                                   │     │
+│  └───────┬───────────────┬───────────────┬───────────────────────────┘     │
+│          ▼               ▼               ▼                                │
+│  ┌─ 阶段4: 命令执行 ──────────────────────────────────────────────┐      │
+│  │  processCommand() → call() → cmd->proc()                       │      │
+│  │  锁: 路径A=无全局锁+MVCC快照; 路径B/C=全局锁                    │      │
+│  │  工作: 参数校验 → ACL检查 → 内存检查 → 执行 → 传播              │      │
+│  └────────────────────────────┬─────────────────────────────────────┘      │
+│                               ▼                                          │
+│  ┌─ 阶段5: 写回复 ────────────────────────────────────────────────┐      │
+│  │  路径A: addReply → replyAsync 缓冲区 → ProcessPendingAsyncWrites│      │
+│  │  路径B/C: addReply → c->buf/c->reply → handlePendingWrites     │      │
+│  │  最终: writeToClient() → connWrite() 发送到 socket              │      │
+│  └──────────────────────────────────────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 异步命令执行（MVCC 快照）
+---
 
-KeyDB 的一大创新是 **只读命令可以不持有全局锁执行**，通过 MVCC 快照实现：
+### 6.2 阶段1：网络读取 `readQueryFromClient()`
+
+**源码位置**: `networking.cpp:2684`
+
+当 epoll 报告某个客户端 socket 可读时，该客户端所绑定的工作线程调用此函数。**关键点：此阶段不需要全局锁**，因为网络读取事件被标记为 `AE_READ_THREADSAFE`。
 
 ```c
-// networking.cpp:2762-2774
-if (cserver.cthreads > 1 || g_pserver->m_pstorageFactory) {
-    parseClientCommandBuffer(c);
-    if (g_pserver->enable_async_commands
-        && !serverTL->disable_async_commands
-        && listLength(g_pserver->monitors) == 0
-        && (aeLockContention() || serverTL->rgdbSnapshot[c->db->id] || g_fTestMode)
-        && !serverTL->in_eval && !serverTL->in_exec)
-    {
-        // 只有当锁有竞争时才启用异步执行（避免不必要的快照开销）
-        processInputBuffer(c, false, CMD_CALL_SLOWLOG | CMD_CALL_STATS | CMD_CALL_ASYNC);
+void readQueryFromClient(connection *conn) {
+    client *c = (client*)connGetPrivateData(conn);
+
+    // ① 断言：不持有全局锁
+    serverAssertDebug(!GlobalLocksAcquired());
+
+    // ② 尝试获取客户端锁（非阻塞）
+    std::unique_lock<decltype(c->lock)> lock(c->lock, std::defer_lock);
+    if (!lock.try_lock())
+        return;  // 锁被占用，跳过此次，下次事件循环再处理
+
+    // ③ 从 socket 读取数据到 querybuf
+    nread = connRead(c->conn, c->querybuf + qblen, readlen);
+
+    // ④ 后续处理...（见阶段2-3）
+}
+```
+
+**锁状态**: 仅持有 `c->lock`（客户端锁），使用 `try_lock` 非阻塞获取。如果获取失败（比如异步写线程正在操作该客户端），直接返回，避免阻塞事件循环。
+
+**线程安全保证**: 每个客户端绑定到固定的事件循环（`c->iel`），读取操作只在该线程上发生，因此不存在多个线程同时读同一个客户端的情况。
+
+---
+
+### 6.3 阶段2：协议解析 `parseClientCommandBuffer()`
+
+**源码位置**: `networking.cpp:2572`
+
+此阶段将 `c->querybuf` 中的原始字节流解析为结构化命令，存入 `c->vecqueuedcmd` 队列：
+
+```c
+void parseClientCommandBuffer(client *c) {
+    while (c->qb_pos < sdslen(c->querybuf)) {
+        // ① 判断协议类型
+        if (c->querybuf[c->qb_pos] == '*')
+            c->reqtype = PROTO_REQ_MULTIBULK;   // RESP 协议
+        else
+            c->reqtype = PROTO_REQ_INLINE;       // 内联协议
+
+        // ② 解析命令，结果入队 c->vecqueuedcmd
+        if (c->reqtype == PROTO_REQ_INLINE)
+            processInlineBuffer(c);
+        else
+            processMultibulkBuffer(c);
+
+        // ③ 异步键值预取（减少后续执行时的缓存未命中）
+        if (g_pserver->prefetch_enabled && !GlobalLocksAcquired()) {
+            c->db->prefetchKeysAsync(c, query);
+        }
     }
 }
 ```
 
-只有同时满足以下条件的命令才能异步执行：
-1. 命令标记为 `CMD_ASYNC_OK | CMD_READONLY`
-2. 不在 EVAL/EXEC 块中
-3. 没有 MONITOR 客户端
-4. 全局锁存在竞争（`aeLockContention()`）或已有快照
+**`vecqueuedcmd` 的角色**: 这是每个客户端的命令队列。解析后的命令（`parsed_command`）存在这里，等待执行。一次 `read()` 可能读到多个完整命令（管道化 pipelining），这些命令都被解析后排队。
+
+**键值预取**: 一个重要的性能优化。在不持有全局锁时，提前将键值从存储层预取到 CPU 缓存中（`prefetchKeysAsync`），这样后续执行命令时就不会因为缓存未命中而阻塞。
+
+---
+
+### 6.4 阶段3：命令路由（三条执行路径）
+
+**源码位置**: `networking.cpp:2762-2784`
+
+这是整个流水线最关键的分叉点。解析完成后，KeyDB 需要决定通过哪条路径执行命令：
+
+```c
+// readQueryFromClient() 的后半部分
+if (cserver.cthreads > 1 || g_pserver->m_pstorageFactory) {
+    // ==================== 多线程模式 ====================
+    parseClientCommandBuffer(c);
+
+    // ─── 路径A：异步快速路径（无全局锁） ───
+    if (g_pserver->enable_async_commands           // 功能启用
+        && !serverTL->disable_async_commands        // 本轮未被禁用
+        && listLength(g_pserver->monitors) == 0     // 无 MONITOR 客户端
+        && (aeLockContention()                      // 全局锁有竞争
+            || serverTL->rgdbSnapshot[c->db->id]    // 或已有快照
+            || g_fTestMode)                         // 或测试模式
+        && !serverTL->in_eval                       // 不在 EVAL 中
+        && !serverTL->in_exec)                      // 不在 EXEC 中
+    {
+        // 频繁写入的客户端不适合此优化（避免频繁更新快照）
+        bool fSnapshotExists = c->db->mvccLastSnapshot >= c->mvccCheckpoint;
+        bool fWriteTooRecent = (getMvccTstamp() - c->mvccCheckpoint) 太小;
+
+        if (!fWriteTooRecent || fSnapshotExists) {
+            processInputBuffer(c, false, CMD_CALL_ASYNC);
+            // 此调用只执行标记为 CMD_ASYNC_OK | CMD_READONLY 的命令
+            // 其余命令留在 vecqueuedcmd 中
+        }
+    }
+
+    // ─── 路径B：延迟批量路径 ───
+    if (!c->vecqueuedcmd.empty())
+        serverTL->vecclientsProcess.push_back(c);
+        // 推入待处理列表，等 beforeSleep() 批量执行
+
+} else {
+    // ==================== 单线程模式 ====================
+    // ─── 路径C：同步直通路径 ───
+    AeLocker locker;
+    locker.arm(c);  // 获取全局锁
+    runAndPropogateToReplicas(processInputBuffer, c, true, CMD_CALL_FULL);
+}
+```
+
+#### 路径A的条件判定（`FAsyncCommand` 函数）
+
+```c
+bool FAsyncCommand(parsed_command &cmd) {
+    if (serverTL->in_eval || serverTL->in_exec)
+        return false;
+    auto parsedcmd = lookupCommand(szFromObj(cmd.argv[0]));
+    if (parsedcmd == nullptr)
+        return false;
+    static const long long expectedFlags = CMD_ASYNC_OK | CMD_READONLY;
+    return (parsedcmd->flags & expectedFlags) == expectedFlags;
+}
+```
+
+只有同时带有 `CMD_ASYNC_OK`（命令实现声明自己支持异步）和 `CMD_READONLY`（只读命令）两个标志的命令才能走路径A。典型命令：`GET`、`MGET`、`STRLEN`、`EXISTS`、`TTL` 等。
+
+#### 路径A的智能开关机制
+
+路径A并不是无条件启用的，它有一套精密的开关逻辑：
+
+| 条件 | 目的 |
+|------|------|
+| `aeLockContention()` 为真 | 只在锁有竞争时才启用（无竞争时获取全局锁更快） |
+| `c->mvccCheckpoint` 检查 | 频繁写入的客户端跳过（写入会导致快照频繁失效） |
+| `snapshot_slip` 阈值 | 允许快照滞后的最大时间（默认 500ms） |
+| `disable_async_commands` | 当快照创建失败时关闭本轮异步命令 |
+
+---
+
+### 6.5 阶段4a：异步命令执行（路径A详解）
+
+这是 KeyDB 最大的性能创新。命令无需全局锁，直接通过 MVCC 快照执行。
+
+#### 进入 `processInputBuffer()` 的异步模式
+
+```c
+void processInputBuffer(client *c, bool fParse, int callFlags) {
+    while (!c->vecqueuedcmd.empty()) {
+        auto &cmd = c->vecqueuedcmd.front();
+
+        // 关键检查：异步模式下，遇到非异步命令立即停止
+        if ((callFlags & CMD_CALL_ASYNC) && !FAsyncCommand(cmd))
+            break;
+
+        // 将 parsed_command 的 argv 转移给客户端
+        c->argc = cmd.argc;
+        c->argv = cmd.argv;
+        cmd.argv = nullptr;
+        c->vecqueuedcmd.erase(c->vecqueuedcmd.begin());
+
+        // 执行命令
+        processCommandAndResetClient(c, callFlags);
+    }
+}
+```
+
+#### `processCommand()` 的异步路径
+
+```c
+int processCommand(client *c, int callFlags) {
+    // 断言：要么持有全局锁，要么是异步命令
+    serverAssert((callFlags & CMD_CALL_ASYNC) || GlobalLocksAcquired());
+
+    // 异步模式下跳过内存驱逐（需要全局锁）
+    if (g_pserver->maxmemory && !(callFlags & CMD_CALL_ASYNC)) {
+        performEvictions(false);
+    }
+
+    // ... 各种前置检查（ACL、集群重定向、只读副本等）...
+
+    // 最终调用 call()
+    call(c, callFlags);
+}
+```
+
+#### `call()` 中的异步特殊处理
+
+```c
+void call(client *c, int flags) {
+    // 断言：异步模式下命令必须是只读的
+    serverAssert(((flags & CMD_CALL_ASYNC) && (c->cmd->flags & CMD_READONLY))
+                 || GlobalLocksAcquired());
+
+    // 异步模式下不初始化 also_propagate（无需传播）
+    if (!(flags & CMD_CALL_ASYNC)) {
+        prev_also_propagate = g_pserver->also_propagate;
+        redisOpArrayInit(&g_pserver->also_propagate);
+    }
+
+    incrementMvccTstamp();  // 递增 MVCC 时间戳
+
+    // ★ 实际执行命令处理函数
+    c->cmd->proc(c);
+
+    // 异步模式下 dirty 设为 0（无需同步）
+    if (flags & CMD_CALL_ASYNC)
+        dirty = 0;
+
+    // 异步模式下不传播到 AOF/副本（因为是只读操作）
+}
+```
+
+#### MVCC 快照如何服务读请求
+
+当异步的只读命令（如 `GET key`）执行时，最终会调用 `lookupKeyRead()` 的异步重载版本：
+
+```c
+robj_roptr lookupKeyRead(redisDb *db, robj *key, uint64_t mvccCheckpoint, AeLocker &locker) {
+    robj_roptr o;
+
+    if (aeThreadOwnsLock()) {
+        // 持有全局锁 → 走正常路径
+        return lookupKeyReadWithFlags(db, key, LOOKUP_NONE);
+    } else {
+        // ★ 这是异步命令的核心路径
+        if (keyIsExpired(db, key))
+            return nullptr;
+
+        int idb = db->id;
+
+        // 检查是否需要创建/更新快照
+        if (serverTL->rgdbSnapshot[idb] == nullptr
+            || serverTL->rgdbSnapshot[idb]->mvccCheckpoint() < mvccCheckpoint)
+        {
+            // 需要获取全局锁来创建快照
+            locker.arm(serverTL->current_client);
+
+            if (serverTL->rgdbSnapshot[idb] != nullptr) {
+                // 快照过旧，需要结束旧快照
+                db->endSnapshot(serverTL->rgdbSnapshot[idb]);
+                serverTL->rgdbSnapshot[idb] = nullptr;
+            } else {
+                // 创建新快照
+                serverTL->rgdbSnapshot[idb] = db->createSnapshot(mvccCheckpoint, true);
+            }
+
+            if (serverTL->rgdbSnapshot[idb] == nullptr) {
+                // 快照创建失败（可选的快照，fOptional=true）
+                o = lookupKeyReadWithFlags(db, key, LOOKUP_NONE);
+                serverTL->disable_async_commands = true;  // 禁用后续异步命令
+            } else {
+                locker.disarm();  // ★ 快照创建成功后释放全局锁！
+            }
+        }
+
+        // ★ 在快照上执行线程安全的键查找
+        if (serverTL->rgdbSnapshot[idb] != nullptr) {
+            o = serverTL->rgdbSnapshot[idb]->find_cached_threadsafe(szFromObj(key)).val();
+        }
+    }
+    return o;
+}
+```
+
+**快照生命周期**:
+1. 首次异步命令 → 获取全局锁 → `createSnapshot()` → 释放全局锁
+2. 后续异步命令 → 直接使用已有快照（**完全无锁**）
+3. `beforeSleep()` → 检查快照是否过期（`FStale()`）→ `endSnapshot()`
+
+**快照的关键优势**: 创建快照只需持有一次全局锁，之后该线程上的所有只读命令都可以复用这个快照，在无锁的情况下执行。这意味着在全局锁被其他线程持有时，本线程仍然可以高速处理只读请求。
+
+---
+
+### 6.6 阶段4b：延迟批量执行（路径B详解）
+
+不满足异步条件的命令（写命令、不支持异步的读命令等）会留在 `c->vecqueuedcmd` 中，客户端指针被推入 `serverTL->vecclientsProcess`。
+
+这些命令在 `beforeSleep()` → `processClients()` 中被批量执行：
+
+```c
+// beforeSleep() 中：
+locker.arm();  // 获取全局锁
+runAndPropogateToReplicas(processClients);
+
+// processClients()：
+void processClients() {
+    serverAssert(GlobalLocksAcquired());  // 必须持有全局锁
+
+    while (!serverTL->vecclientsProcess.empty()) {
+        client *c = serverTL->vecclientsProcess.front();
+        serverTL->vecclientsProcess.erase(serverTL->vecclientsProcess.begin());
+
+        std::unique_lock<fastlock> ul(c->lock);  // 获取客户端锁
+        processInputBuffer(c, false, CMD_CALL_FULL);  // CMD_CALL_FULL 包含传播
+    }
+
+    // 处理异步写
+    if (listLength(serverTL->clients_pending_asyncwrite))
+        ProcessPendingAsyncWrites();
+}
+```
+
+**批量执行的好处**:
+1. 全局锁只获取一次，然后连续处理多个客户端的命令
+2. 减少锁获取/释放的开销
+3. `runAndPropogateToReplicas` 包裹器确保复制数据被批量刷新
+
+#### `runAndPropogateToReplicas` 包裹器
+
+```c
+template<typename FN_PTR, typename... TARGS>
+void runAndPropogateToReplicas(FN_PTR *pfn, TARGS... args) {
+    bool fNestedProcess = (g_pserver->repl_batch_idxStart >= 0);
+    if (!fNestedProcess) {
+        // 记录复制偏移量起始位置
+        g_pserver->repl_batch_offStart = g_pserver->master_repl_offset;
+        g_pserver->repl_batch_idxStart = g_pserver->repl_backlog_idx;
+    }
+
+    pfn(args...);  // 执行实际函数
+
+    if (!fNestedProcess) {
+        // 将累积的复制数据一次性刷新给所有副本
+        flushReplBacklogToClients();
+        g_pserver->repl_batch_offStart = -1;
+    }
+}
+```
+
+---
+
+### 6.7 阶段4c：同步直通执行（路径C详解）
+
+单线程模式（`cserver.cthreads == 1`）下的最短路径：
+
+```c
+// readQueryFromClient() 中的单线程分支
+AeLocker locker;
+locker.arm(c);  // 获取全局锁
+runAndPropogateToReplicas(processInputBuffer, c, true /*fParse*/, CMD_CALL_FULL);
+```
+
+这里 `processInputBuffer` 的 `fParse=true` 参数表示在执行前先调用 `parseClientCommandBuffer(c)` 重新解析（因为单线程模式下之前没有单独解析过）。
+
+**为什么单线程模式不走路径B的延迟批量？**
+
+```c
+// 注释原文：If we're single threaded its actually better to just
+// process the command here while the query is hot in the cache.
+// Multithreaded lock contention dominates and batching is better.
+```
+
+单线程无锁竞争，数据在 CPU 缓存中是热的（刚从 querybuf 解析出来），直接执行效率最高。多线程下锁竞争是瓶颈，所以批量化更有利。
+
+---
+
+### 6.8 阶段5：写回复的两条路径
+
+命令执行完成后需要将结果写回客户端。根据命令是否在正确的线程上执行，写回复分为**同步路径**和**异步路径**。
+
+#### `addReply()` 的入口选择
+
+```c
+void addReply(client *c, robj_roptr obj) {
+    if (prepareClientToWrite(c) != C_OK) return;
+    _addReplyToBuffer(c, data, len);
+}
+```
+
+`prepareClientToWrite()` 是路由的关键：
+
+```c
+int prepareClientToWrite(client *c) {
+    bool fAsync = !FCorrectThread(c);  // 不在正确线程上 → 异步
+
+    if (!fAsync) {
+        // 同步路径：安装写处理器
+        clientInstallWriteHandler(c);
+    } else {
+        // 异步路径：加入异步写列表
+        clientInstallAsyncWriteHandler(c);
+    }
+    return C_OK;
+}
+```
+
+#### 同步写路径
+
+```c
+void clientInstallWriteHandler(client *c) {
+    if (!(c->flags & CLIENT_PENDING_WRITE)) {
+        c->flags |= CLIENT_PENDING_WRITE;
+        // 加入线程本地的待写列表
+        std::unique_lock<fastlock> lockf(g_pserver->rgthreadvar[c->iel].lockPendingWrite);
+        g_pserver->rgthreadvar[c->iel].clients_pending_write.push_back(c);
+    }
+}
+```
+
+数据写入 `c->buf`（小回复的固定缓冲区）或 `c->reply`（大回复的链表）。
+
+#### 异步写路径
+
+当命令在**非绑定线程**上执行时（如全局锁持有线程恰好不是客户端所属线程），回复数据写入特殊的 `c->replyAsync` 缓冲区：
+
+```c
+int _addReplyToBuffer(client *c, const char *s, size_t len) {
+    bool fAsync = !FCorrectThread(c);
+    if (fAsync) {
+        // 写入异步缓冲区（不需要客户端锁，因为只有当前线程操作）
+        if (c->replyAsync == nullptr) {
+            c->replyAsync = (clientReplyBlock*)zmalloc(...);
+        }
+        memcpy(c->replyAsync->buf() + c->replyAsync->used, s, len);
+        c->replyAsync->used += len;
+    } else {
+        // 写入正常缓冲区
+        memcpy(c->buf + c->bufpos, s, len);
+        c->bufpos += len;
+    }
+}
+```
+
+异步缓冲区稍后由 `ProcessPendingAsyncWrites()` 合并到正常缓冲区。
+
+#### `handleClientsWithPendingWrites()` —— 写回复的最终执行
+
+这是 `beforeSleep()` 中释放全局锁后调用的函数：
+
+```c
+int handleClientsWithPendingWrites(int iel, int aof_state) {
+    // ① 先处理异步写缓冲区
+    if (listLength(serverTL->clients_pending_asyncwrite)) {
+        AeLocker locker;
+        locker.arm(nullptr);
+        ProcessPendingAsyncWrites();  // 合并 replyAsync → buf/reply
+    }
+
+    // ② 取出待写客户端列表
+    std::unique_lock<fastlock> lockf(g_pserver->rgthreadvar[iel].lockPendingWrite);
+    auto vec = std::move(g_pserver->rgthreadvar[iel].clients_pending_write);
+    lockf.unlock();
+
+    // ③ 尝试直接写入 socket（避免注册写事件的系统调用开销）
+    for (client *c : vec) {
+        if (writeToClient(c, 0) == C_ERR)
+            continue;
+
+        // ④ 如果还有数据未写完，注册写事件处理器
+        if (clientHasPendingReplies(c)) {
+            connSetWriteHandlerWithBarrier(c->conn, sendReplyToClient, ae_flags, true);
+        }
+    }
+}
+```
+
+`writeToClient()` 尝试直接 `connWrite()` 发送数据。如果一次写不完（socket 缓冲区满），则注册 `sendReplyToClient` 作为写事件回调，等到下次 epoll 报告可写时继续发送。
+
+**注意**: `writeToClient()` 和 `sendReplyToClient()` 都标记为 `AE_WRITE_THREADSAFE`，**不需要全局锁**，仅需要客户端锁。
+
+---
+
+### 6.9 `ProcessPendingAsyncWrites()` —— 异步写的合并
+
+这个函数将 `replyAsync` 异步缓冲区的数据合并到客户端的正常输出缓冲区：
+
+```c
+void ProcessPendingAsyncWrites() {
+    serverAssert(GlobalLocksAcquired());  // 需要全局锁
+
+    while (listLength(serverTL->clients_pending_asyncwrite)) {
+        client *c = listFirst(serverTL->clients_pending_asyncwrite);
+        std::lock_guard<decltype(c->lock)> lock(c->lock);
+
+        if (c->replyAsync != nullptr) {
+            size_t size = c->replyAsync->used;
+
+            if (listLength(c->reply) == 0 && size <= PROTO_REPLY_CHUNK_BYTES - c->bufpos) {
+                // 小回复：直接追加到固定缓冲区
+                memcpy(c->buf + c->bufpos, c->replyAsync->buf(), size);
+                c->bufpos += size;
+            } else {
+                // 大回复：追加到回复链表
+                listAddNodeTail(c->reply, c->replyAsync);
+                c->replyAsync = nullptr;
+            }
+            zfree(c->replyAsync);
+            c->replyAsync = nullptr;
+        }
+
+        // 通知客户端所属线程安装写事件
+        if (FCorrectThread(c)) {
+            prepareClientToWrite(c);  // 同线程直接安装
+        } else {
+            // 跨线程通过 postFunction 投递
+            c->postFunction([](client *c) {
+                clientInstallWriteHandler(c);
+                handleClientsWithPendingWrites(c->iel, g_pserver->aof_state);
+            }, false);
+        }
+    }
+}
+```
+
+---
+
+### 6.10 完整时序图：一个 GET 命令的多线程生命周期
+
+以下展示了一个 `GET mykey` 命令在多线程高负载场景下走异步路径A的完整时序：
+
+```
+Thread #1 (客户端绑定线程)                 Thread #0 (持有全局锁处理写命令)
+═══════════════════════════               ═══════════════════════════════
+                                          持有 g_lock, 执行 SET/DEL 等
+
+epoll_wait() 返回: client fd 可读
+│
+afterSleep()
+├─ aeThreadOnline()                       │
+│                                         │
+readQueryFromClient()                     │ (g_lock 被 Thread #0 持有)
+├─ c->lock.try_lock() ✓                  │
+├─ connRead() → "GET mykey\r\n"          │
+├─ parseClientCommandBuffer()             │
+│  └─ vecqueuedcmd += {GET, mykey}        │
+│                                         │
+├─ [条件满足: CMD_ASYNC_OK,               │
+│   aeLockContention()=true]              │
+│                                         │
+├─ processInputBuffer(ASYNC)              │
+│  └─ processCommandAndResetClient(ASYNC) │
+│     └─ processCommand(ASYNC)            │
+│        └─ call(ASYNC)                   │
+│           └─ getCommand(c)              │
+│              └─ lookupKeyRead(ASYNC)    │
+│                 ├─ rgdbSnapshot == NULL  │
+│                 ├─ locker.arm(c)        │
+│                 │  ├─ c->lock.unlock()  │
+│                 │  ├─ aeAcquireLock()   │ ← 等待 Thread #0 释放
+│                 │  │      ...等待...     │
+│                 │  │                    aeReleaseLock() ← Thread #0 释放
+│                 │  ├─ g_lock 获取 ✓     │
+│                 │  └─ c->lock.lock() ✓  │
+│                 │                       │
+│                 ├─ createSnapshot() ✓   │
+│                 ├─ locker.disarm()       │ ← ★ 释放全局锁！
+│                 │  └─ aeReleaseLock()   │
+│                 │                       │ Thread #0 可以再次获取锁
+│                 └─ snapshot->find("mykey") ← 无锁读取！
+│                    └─ 返回 "hello"      │
+│                                         │
+│           └─ addReply(c, "hello")       │
+│              └─ _addReplyToBuffer(同线程)│
+│                 └─ memcpy → c->buf      │
+│                                         │
+│           └─ commandProcessed()         │
+│              └─ resetClient()           │
+│                                         │
+├─ c->lock.unlock()                       │
+│                                         │
+beforeSleep()                             │
+├─ locker.arm() → g_lock                  │
+├─ [检查快照是否过期]                     │
+├─ handleClientsWithPendingWrites()       │
+│  ├─ locker.disarm() → 释放 g_lock      │
+│  ├─ writeToClient(c, 0)                │
+│  │  └─ connWrite("$5\r\nhello\r\n")    │ ← 发送到 socket
+│  └─ [写完, 无需注册写事件]              │
+│                                         │
+epoll_wait()                              │
+```
+
+**关键观察**:
+1. 快照创建只需短暂持有全局锁（微秒级）
+2. 数据查找通过快照完成，完全无锁
+3. 后续相同 DB 的 GET 命令可以直接复用快照，全程无锁
+4. `writeToClient()` 也无需全局锁
+
+---
+
+### 6.11 对比：一个 SET 命令走路径B的完整时序
+
+```
+Thread #1                                Thread #0
+═════════                                ═════════
+
+readQueryFromClient()
+├─ connRead() → "SET mykey hello\r\n"
+├─ parseClientCommandBuffer()
+│  └─ vecqueuedcmd += {SET, mykey, hello}
+│
+├─ [尝试异步: FAsyncCommand() = false]   ← SET 不是 CMD_READONLY
+│  (SET 有 CMD_WRITE 标志, 不满足条件)
+│
+├─ vecclientsProcess.push_back(c)        ← 推迟到 beforeSleep
+│
+beforeSleep()
+├─ locker.arm() → g_lock                 (等待 g_lock)
+├─ runAndPropogateToReplicas(processClients)
+│  ├─ 记录 repl_batch_offStart
+│  ├─ processClients()
+│  │  ├─ c->lock.lock()
+│  │  └─ processInputBuffer(CMD_CALL_FULL)
+│  │     └─ processCommandAndResetClient(CMD_CALL_FULL)
+│  │        └─ processCommand(CMD_CALL_FULL)
+│  │           ├─ performEvictions()
+│  │           └─ call(CMD_CALL_FULL)
+│  │              ├─ setCommand(c)
+│  │              │  └─ lookupKeyWrite() / dbAdd()
+│  │              ├─ dirty++
+│  │              ├─ c->mvccCheckpoint = getMvccTstamp()
+│  │              └─ propagate() → AOF + 副本
+│  │  └─ c->lock.unlock()
+│  ├─ flushReplBacklogToClients()
+│  └─ repl_batch_offStart = -1
+│
+├─ handleClientsWithPendingWrites()
+│  ├─ locker.disarm() → 释放 g_lock
+│  └─ writeToClient() → connWrite("+OK\r\n")
+│
+epoll_wait()
+```
+
+---
+
+### 6.12 `commandProcessed()` —— 命令后处理
+
+每个命令成功执行后调用，负责清理和复制偏移量更新：
+
+```c
+void commandProcessed(client *c, int flags) {
+    if (c->flags & CLIENT_BLOCKED) return;
+
+    resetClient(c);  // 清理 argv, 重置标志位
+
+    // 如果客户端是主节点（复制场景），更新已应用的复制偏移量
+    if (c->flags & CLIENT_MASTER && !(c->flags & CLIENT_MULTI)) {
+        c->reploff = c->reploff_cmd;
+    }
+
+    // 将复制数据传播给下游副本
+    if (c->flags & CLIENT_MASTER) {
+        long long applied = c->reploff - prev_offset;
+        if (applied) {
+            replicationFeedSlavesFromMasterStream(applied);
+        }
+    }
+}
+```
+
+---
+
+### 6.13 性能影响汇总
+
+| 阶段 | 持有全局锁 | 持有客户端锁 | 可并行度 |
+|------|:----------:|:----------:|:--------:|
+| 网络读取 | ✗ | ✓ | 完全并行 |
+| 协议解析 | ✗ | ✓ | 完全并行 |
+| 键值预取 | ✗ | ✓ | 完全并行 |
+| 只读执行(快照) | 创建时短暂持有 | ✓ | 近乎完全并行 |
+| 写命令执行 | ✓ | ✓ | 串行 |
+| 写回复(buf) | ✗ | ✓ | 完全并行 |
+| 异步回复合并 | ✓ | ✓ | 串行 |
+| 传播到副本 | ✓ | ✗ | 串行 |
+
+**核心结论**: 对于读多写少的工作负载，KeyDB 的多线程效果最为显著——所有读操作都能真正并行执行。对于写密集型工作负载，性能提升主要来自 I/O 读写的并行化。
 
 ## 7. 锁获取/释放的时序分析
 
